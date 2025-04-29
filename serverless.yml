@@ -1,0 +1,376 @@
+# ===================================================
+# CONFIGURACIÓN BÁSICA DEL SERVICIO
+# ===================================================
+service: prueba-rimac-2025 # Nombre del servicio/proyecto
+frameworkVersion: "4" # Versión de Serverless Framework
+
+# ===================================================
+# PLUGINS UTILIZADOS
+# ===================================================
+plugins:
+  - serverless-offline # Permite ejecutar localmente el proyecto simulando AWS
+  #- serverless-esbuild    # (Opcional) Para compilación más rápida de TypeScript
+
+# ===================================================
+# CONFIGURACIÓN DEL PROVEEDOR (AWS)
+# ===================================================
+provider:
+  name: aws # Usaremos AWS como proveedor de cloud
+  runtime: nodejs18.x # Entorno de ejecución Node.js 18
+  region: us-east-1 # Región de AWS donde se desplegará (Norte de Virginia)
+  stage: ${opt:stage, 'dev'} # Etapa (dev, prod, etc.) se puede pasar como parámetro
+
+  # Configuración del API Gateway HTTP (v2)
+  httpApi:
+    cors: true # Habilita CORS para todas las rutas
+
+  # =================================================
+  # VARIABLES DE ENTORNO (GLOBALES PARA TODAS LAS LAMBDA)
+  # =================================================
+  environment:
+    # Tabla DynamoDB para almacenar las citas médicas
+    DYNAMODB_TABLE: ${self:service}-appointments-${sls:stage}
+
+    # ARN del topic SNS para notificaciones
+    SNS_TOPIC_ARN: !Ref AppointmentTopic
+
+    # ARNs de las colas SQS para Perú y Chile
+    SQS_PE_ARN: !GetAtt SqsPeQueue.Arn
+    SQS_CL_ARN: !GetAtt SqsClQueue.Arn
+
+    # Nombre del Event Bus para manejar eventos
+    EVENT_BUS_NAME: ${self:service}-event-bus-${sls:stage}
+
+    # Configuración de RDS (Base de datos relacional)
+    RDS_PE_HOST: ${ssm:/${sls:stage}/rds/pe/host} # Host de RDS para Perú (almacenada en SSM)
+    RDS_CL_HOST: ${ssm:/${sls:stage}/rds/cl/host} # Host de RDS para Chile (almacenada en SSM)
+    RDS_USER: ${ssm:/${sls:stage}/rds/username} # Usuario de la base de datos (almacenada en SSM)
+    RDS_PASSWORD: ${ssm:/${sls:stage}/rds/password} # Contraseña (almacenada en SSM)
+    RDS_DATABASE: medical_appointments # Nombre de la base de datos
+
+  # =================================================
+  # PERMISOS IAM (POLÍTICAS DE ACCESO PARA LAS LAMBDAS)
+  # =================================================
+  iam:
+    role:
+      statements:
+        # Permisos para DynamoDB:
+        # - PutItem: Crear nuevos registros
+        # - Query: Buscar registros
+        # - UpdateItem: Actualizar registros
+        # - GetItem: Obtener un registro específico
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+            - dynamodb:GetItem
+          Resource:
+            - !GetAtt AppointmentsTable.Arn # Acceso a la tabla principal
+            - !Join ["/", [!GetAtt AppointmentsTable.Arn, "index/*"]] # Y a sus índices
+
+        # Permisos para SNS (Simple Notification Service):
+        # - Publish: Publicar mensajes en el topic
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource: !Ref AppointmentTopic
+
+        # Permisos para SQS (Simple Queue Service):
+        # - SendMessage: Enviar mensajes a la cola
+        # - ReceiveMessage: Recibir mensajes
+        # - DeleteMessage: Eliminar mensajes procesados
+        # - GetQueueAttributes: Obtener información de la cola
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - !GetAtt SqsPeQueue.Arn # Cola de Perú
+            - !GetAtt SqsClQueue.Arn # Cola de Chile
+            - !GetAtt ConfirmationQueue.Arn # Cola de confirmaciones
+
+        # Permisos para EventBridge (Eventos):
+        # - PutEvents: Publicar eventos en el Event Bus
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource: arn:aws:events:us-east-1:*:event-bus/${self:service}-event-bus-${sls:stage}
+
+# ===================================================
+# CONFIGURACIÓN DE EMPAQUETADO (QUÉ ARCHIVOS SE INCLUYEN)
+# ===================================================
+package:
+  patterns:
+    - "!**/*" # Excluye todo por defecto
+    - "src/**/*.ts" # Incluye archivos TypeScript
+    - "!src/**/*.test.ts" # Excluye archivos de pruebas
+
+# ===================================================
+# CONFIGURACIÓN PERSONALIZADA PARA ESBUILD (COMPILACIÓN)
+# ===================================================
+custom:
+  docsPath: docs/openapi.yaml
+  esbuild:
+    bundle: true # Empqueta todo en un solo archivo
+    minify: false # No minificar el código (para dev)
+    sourcemap: false # No generar sourcemaps
+    target: "node18" # Compatibilidad con Node.js 18
+    platform: "node" # Plataforma Node.js
+    concurrency: 10 # Número de procesos paralelos
+    external:
+      - "@aws-sdk/*" # Excluye el SDK de AWS del bundle
+
+# ===================================================
+# RECURSOS DE AWS QUE SE CREARÁN (INFRAESTRUCTURA)
+# ===================================================
+resources:
+  Resources:
+    # -------------------------------------------------
+    # 1. TABLA DYNAMODB PARA CITAS MÉDICAS
+    # -------------------------------------------------
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
+        AttributeDefinitions:
+          - AttributeName: appointmentId # ID único de la cita
+            AttributeType: S # Tipo String
+          - AttributeName: insuredId # ID del asegurado
+            AttributeType: S
+          - AttributeName: status # Estado de la cita
+            AttributeType: S
+        KeySchema:
+          - AttributeName: appointmentId # Clave primaria
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST # Modo de facturación (pago por uso)
+        GlobalSecondaryIndexes:
+          - IndexName: insuredId-status-index # Índice secundario
+            KeySchema:
+              - AttributeName: insuredId # Para búsquedas por asegurado
+                KeyType: HASH
+              - AttributeName: status # Y filtrar por estado
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL # Incluir todos los atributos
+
+    # -------------------------------------------------
+    # 2. TÓPICO SNS PARA NOTIFICACIONES DE CITAS
+    # -------------------------------------------------
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointment-topic-${sls:stage}
+
+    # -------------------------------------------------
+    # 3. COLAS SQS PRINCIPALES (PERÚ Y CHILE)
+    # -------------------------------------------------
+    SqsPeQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_PE_${sls:stage} # Cola para Perú
+        VisibilityTimeout: 300 # Tiempo (segundos) que un mensaje es invisible tras ser leído
+        RedrivePolicy: # Política de reintentos
+          deadLetterTargetArn: !GetAtt SqsPeQueueDLQ.Arn # Cola de mensajes fallidos
+          maxReceiveCount: 3 # Intentos máximos antes de mover a DLQ
+
+    SqsClQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_CL_${sls:stage} # Cola para Chile
+        VisibilityTimeout: 300
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt SqsClQueueDLQ.Arn
+          maxReceiveCount: 3
+
+    # -------------------------------------------------
+    # 4. COLA DE CONFIRMACIONES (PARA EVENTBRIDGE)
+    # -------------------------------------------------
+    ConfirmationQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-confirmation-${sls:stage}
+        VisibilityTimeout: 300
+
+    # -------------------------------------------------
+    # 5. COLAS DE MENSAJES FALLIDOS (DLQ - DEAD LETTER QUEUES)
+    # -------------------------------------------------
+    SqsPeQueueDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_PE_${sls:stage}_DLQ # DLQ para Perú
+
+    SqsClQueueDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_CL_${sls:stage}_DLQ # DLQ para Chile
+
+    # -------------------------------------------------
+    # 6. EVENT BUS PERSONALIZADO PARA MANEJAR EVENTOS
+    # -------------------------------------------------
+    EventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:provider.environment.EVENT_BUS_NAME}
+
+    # -------------------------------------------------
+    # 7. REGLA DE EVENTBRIDGE PARA CONFIRMACIONES
+    # -------------------------------------------------
+    ConfirmationRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref EventBus
+        Name: ${self:service}-confirmation-rule-${sls:stage}
+        EventPattern:
+          source:
+            - "medical.appointment" # Solo eventos de este origen
+          detail-type:
+            - "AppointmentConfirmation" # Solo eventos de este tipo
+        Targets:
+          - Arn: !GetAtt ConfirmationQueue.Arn # Enviar a la cola de confirmaciones
+            Id: "ConfirmationQueueTarget"
+
+    # -------------------------------------------------
+    # 8. POLÍTICAS DE ACCESO PARA SQS (PERMITIR SNS)
+    # -------------------------------------------------
+    SqsPeQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SqsPeQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com # Solo el servicio SNS
+              Action: sqs:SendMessage # Puede enviar mensajes
+              Resource: !GetAtt SqsPeQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic # Solo desde nuestro topic
+
+    SqsClQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SqsClQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt SqsClQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    # -------------------------------------------------
+    # 9. POLÍTICA PARA QUE EVENTBRIDGE ESCRIBA EN SQS
+    # -------------------------------------------------
+    ConfirmationQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref ConfirmationQueue
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com # Solo el servicio EventBridge
+              Action: sqs:SendMessage
+              Resource: !GetAtt ConfirmationQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt ConfirmationRule.Arn # Solo nuestra regla
+
+    # -------------------------------------------------
+    # 10. SUSCRIPCIONES SNS→SQS (CON FILTROS POR PAÍS)
+    # -------------------------------------------------
+    PeQueueSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs # Tipo de suscripción: SQS
+        Endpoint: !GetAtt SqsPeQueue.Arn # Cola destino (Perú)
+        FilterPolicy:
+          countryISO: ["PE"] # Solo mensajes con país=PE
+        RawMessageDelivery: true # Entrega el mensaje sin metadatos
+
+    ClQueueSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt SqsClQueue.Arn # Cola destino (Chile)
+        FilterPolicy:
+          countryISO: ["CL"] # Solo mensajes con país=CL
+        RawMessageDelivery: true
+
+# ===================================================
+# FUNCIONES LAMBDA (CÓDIGO QUE SE EJECUTA)
+# ===================================================
+functions:
+  functions:
+  swagger:
+    handler: src/interfaces/lambda/swagger.handler
+    events:
+      - http:
+          path: /api-docs
+          method: get
+          cors: true
+    environment:
+      DOCS_PATH: docs/openapi.yaml
+  # -------------------------------------------------
+  # LAMBDA PRINCIPAL (API - CREAR Y LISTAR CITAS)
+  # -------------------------------------------------
+  appointment:
+    handler: src/interfaces/lambda/appointment.handler # Archivo que contiene la función
+    description: Maneja la API de agendamiento
+    events:
+      - httpApi:
+          path: /appointments # Ruta POST para crear citas
+          method: POST
+      - httpApi:
+          path: /appointments/{insuredId} # Ruta GET para listar citas
+          method: GET
+    environment:
+      SNS_TOPIC_ARN: !Ref AppointmentTopic # Variable específica para esta lambda
+
+  # -------------------------------------------------
+  # LAMBDA PROCESADORA DE CITAS (PERÚ)
+  # -------------------------------------------------
+  appointmentPeProcessor:
+    handler: src/interfaces/lambda/appointment-pe.handler
+    description: Procesa citas de Perú desde SQS_PE
+    events:
+      - sqs:
+          arn: !GetAtt SqsPeQueue.Arn # Se dispara con mensajes de esta cola
+          batchSize: 1 # Procesa 1 mensaje a la vez
+
+  # -------------------------------------------------
+  # LAMBDA PROCESADORA DE CITAS (CHILE)
+  # -------------------------------------------------
+  appointmentClProcessor:
+    handler: src/interfaces/lambda/appointment-cl.handler
+    description: Procesa citas de Chile desde SQS_CL
+    events:
+      - sqs:
+          arn: !GetAtt SqsClQueue.Arn
+          batchSize: 1
+
+  # -------------------------------------------------
+  # LAMBDA PROCESADORA DE CONFIRMACIONES
+  # -------------------------------------------------
+  confirmationProcessor:
+    handler: src/interfaces/lambda/confirmation.handler
+    description: Actualiza estado de citas a completado
+    events:
+      - sqs:
+          arn: !GetAtt ConfirmationQueue.Arn
+          batchSize: 1
